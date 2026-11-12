@@ -2,8 +2,8 @@ name: Auto-Sync Fork & Build
 
 on:
   schedule:
-    # Runs daily at 04:00 UTC. Only scheduled workflows on the default branch run automatically.
-    - cron: '0 4 * * *'
+    # Runs weekly on Sundays at 04:00 UTC. Only scheduled workflows on the default branch run automatically.
+    - cron: '0 4 * * 0'
   workflow_dispatch:
     inputs:
       force_build:
@@ -58,8 +58,10 @@ jobs:
         if: steps.sync.outputs.updated == 'true' || github.event.inputs.force_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh workflow run preview.yml \
+            --repo "${{ github.repository }}" \
             --ref master \
             -f branch=feat/self-hosted-profile-sync \
             -f build_android=true \
