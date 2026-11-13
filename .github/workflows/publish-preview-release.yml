@@ -1,9 +1,13 @@
 name: Publish Preview Release
 
 on:
-  workflow_run:
-    workflows: ["Build Preview"]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build Preview run ID (leave blank for latest successful run)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -11,14 +15,36 @@ permissions:
 
 jobs:
   publish-release:
-    if: github.repository == 'mattjohnpowell/skystream' && github.event.workflow_run.conclusion == 'success'
+    if: github.repository == 'mattjohnpowell/skystream'
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve Build Preview run ID
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          RUN_ID="${{ github.event.inputs.run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list \
+              --repo "$GH_REPO" \
+              --workflow=preview.yml \
+              --status=success \
+              --limit=1 \
+              --json databaseId \
+              -q '.[0].databaseId')
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No successful Build Preview run found."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
       - name: Download build artifacts
         uses: actions/download-artifact@v7
         with:
           path: ./artifacts
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           merge-multiple: true
 
@@ -30,12 +56,12 @@ jobs:
           shopt -s nullglob
           files=(./artifacts/*)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "No artifacts found to publish."
-            exit 0
+            echo "::error::No artifacts found in run ${{ steps.resolve.outputs.run_id }}."
+            exit 1
           fi
           gh release delete sync-preview --repo "$GH_REPO" --cleanup-tag --yes || true
           gh release create sync-preview "${files[@]}" \
             --repo "$GH_REPO" \
             --title "Profile Sync Preview (Latest)" \
-            --notes "Automated build from workflow run ${{ github.event.workflow_run.html_url }}." \
+            --notes "Automated build from https://github.com/$GH_REPO/actions/runs/${{ steps.resolve.outputs.run_id }}." \
             --prerelease
