@@ -53,8 +53,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          shopt -s nullglob
-          files=(./artifacts/*)
+          mapfile -t files < <(find ./artifacts -type f | sort)
+          printf 'Files to upload:\n%s\n' "${files[@]}"
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::No artifacts found in run ${{ steps.resolve.outputs.run_id }}."
             exit 1
