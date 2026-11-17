@@ -1,0 +1,309 @@
+# Build Android and Windows, then attach the files to the rolling
+# sync-preview release. A manual run always builds. The Sunday schedule
+# builds only after the feature branch has taken new upstream commits.
+
+name: Build & Publish
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: preview-release
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  INNO_SETUP_VERSION: 7.1.0
+  INNO_SETUP_INSTALLER: innosetup-7.1.0-x64.exe
+  INNO_SETUP_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+
+jobs:
+  sync:
+    name: Sync feature branch
+    if: github.repository == 'mattjohnpowell/skystream'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and feature branch
+        run: |
+          git remote add upstream https://github.com/akashdh11/skystream.git || true
+          git fetch upstream master
+          git fetch origin feat/self-hosted-profile-sync
+
+      - name: Rebase onto upstream
+        id: sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          UPDATED=false
+          if git merge-base --is-ancestor upstream/master origin/feat/self-hosted-profile-sync; then
+            echo "Already up to date with upstream/master."
+            SHA="$(git rev-parse origin/feat/self-hosted-profile-sync)"
+          else
+            git checkout -B feat/self-hosted-profile-sync origin/feat/self-hosted-profile-sync
+            if ! git rebase upstream/master; then
+              git rebase --abort
+              echo "::error::Rebase conflict with upstream/master. Resolve it on feat/self-hosted-profile-sync, then run this again."
+              exit 1
+            fi
+            git push --force-with-lease origin feat/self-hosted-profile-sync
+            UPDATED=true
+            SHA="$(git rev-parse HEAD)"
+          fi
+          echo "updated=$UPDATED" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          # A click always builds. The weekly run builds only after a rebase.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$UPDATED" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream has not changed. Skipping the build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  android:
+    name: Android
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Install dependencies
+        run: |
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Strip desktop TorrServer binaries
+        run: rm -f packages/flutter_torrent_server/assets/torrserver/TorrServer-*
+
+      - name: Decode keystore
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/release.jks
+          echo "storePassword=$ANDROID_STORE_PASSWORD" > android/key.properties
+          echo "keyPassword=$ANDROID_KEY_PASSWORD" >> android/key.properties
+          echo "keyAlias=$ANDROID_KEY_ALIAS" >> android/key.properties
+          echo "storeFile=release.jks" >> android/key.properties
+
+      - name: Generate dart-defines file
+        run: |
+          cat > dart-defines.json << 'JSON_EOF'
+          {
+            "TMDB_API_KEY": "${{ secrets.TMDB_API_KEY }}",
+            "SIMKL_CLIENT_ID": "${{ secrets.SIMKL_CLIENT_ID }}",
+            "SIMKL_CLIENT_SECRET": "${{ secrets.SIMKL_CLIENT_SECRET }}",
+            "SIMKL_V2_CLIENT_ID": "${{ secrets.SIMKL_V2_CLIENT_ID }}",
+            "TRAKT_CLIENT_ID": "${{ secrets.TRAKT_CLIENT_ID }}",
+            "TRAKT_CLIENT_SECRET": "${{ secrets.TRAKT_CLIENT_SECRET }}",
+            "MAL_CLIENT_ID": "${{ secrets.MAL_CLIENT_ID }}",
+            "MAL_CLIENT_SECRET": "${{ secrets.MAL_CLIENT_SECRET }}",
+            "ANILIST_CLIENT_ID": "${{ secrets.ANILIST_CLIENT_ID }}",
+            "ANIMESKIP_CLIENT_ID": "${{ secrets.ANIMESKIP_CLIENT_ID }}",
+            "OPENSUBTITLES_API_KEY": "${{ secrets.OPENSUBTITLES_API_KEY }}"
+          }
+          JSON_EOF
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release --dart-define-from-file=dart-defines.json
+          cp build/app/outputs/flutter-apk/app-release.apk skystream-android-preview.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: skystream-android-preview.apk
+          retention-days: 1
+          if-no-files-found: error
+
+  windows:
+    name: Windows
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Strip unused TorrServer binaries
+        shell: pwsh
+        run: |
+          Set-Location packages/flutter_torrent_server/assets/torrserver
+          Get-ChildItem -File | Where-Object { $_.Name -ne "TorrServer-windows-amd64.exe" } | Remove-Item
+
+      - name: Set up Java for CloudStream
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: x64
+
+      - name: Bundle CloudStream's Java runtime
+        shell: bash
+        run: dart run packages/cs3_engine/tool/build_runtime.dart --java-home "$JAVA_HOME"
+
+      - name: Generate dart-defines file
+        shell: bash
+        run: |
+          cat > dart-defines.json << 'JSON_EOF'
+          {
+            "TMDB_API_KEY": "${{ secrets.TMDB_API_KEY }}",
+            "SIMKL_CLIENT_ID": "${{ secrets.SIMKL_CLIENT_ID }}",
+            "SIMKL_CLIENT_SECRET": "${{ secrets.SIMKL_CLIENT_SECRET }}",
+            "SIMKL_V2_CLIENT_ID": "${{ secrets.SIMKL_V2_CLIENT_ID }}",
+            "TRAKT_CLIENT_ID": "${{ secrets.TRAKT_CLIENT_ID }}",
+            "TRAKT_CLIENT_SECRET": "${{ secrets.TRAKT_CLIENT_SECRET }}",
+            "MAL_CLIENT_ID": "${{ secrets.MAL_CLIENT_ID }}",
+            "MAL_CLIENT_SECRET": "${{ secrets.MAL_CLIENT_SECRET }}",
+            "ANILIST_CLIENT_ID": "${{ secrets.ANILIST_CLIENT_ID }}",
+            "ANIMESKIP_CLIENT_ID": "${{ secrets.ANIMESKIP_CLIENT_ID }}",
+            "OPENSUBTITLES_API_KEY": "${{ secrets.OPENSUBTITLES_API_KEY }}"
+          }
+          JSON_EOF
+
+      - name: Build Windows
+        run: flutter build windows --release --dart-define-from-file=dart-defines.json
+
+      - name: Check libVLC's plugin cache tool
+        shell: pwsh
+        run: |
+          $Release = "build\windows\x64\runner\Release"
+          $Plugins = (Resolve-Path "$Release\plugins").Path
+          & "$Release\vlc-cache-gen.exe" $Plugins
+          if ($LASTEXITCODE -ne 0) { throw "vlc-cache-gen.exe failed on the bundle" }
+          $Cache = Get-Item "$Release\plugins\plugins.dat" -ErrorAction Stop
+          if ($Cache.Length -lt 100000) { throw "plugins.dat is only $($Cache.Length) bytes" }
+          Get-ChildItem "$Release\plugins" -Filter "plugins.dat*" | Remove-Item
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $Tag = 'is-' + $env:INNO_SETUP_VERSION.Replace('.', '_')
+          $Installer = Join-Path $env:RUNNER_TEMP $env:INNO_SETUP_INSTALLER
+          Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$Tag/$env:INNO_SETUP_INSTALLER" -OutFile $Installer -MaximumRetryCount 3 -RetryIntervalSec 10
+          $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Installer).Hash
+          if ($Hash -ne $env:INNO_SETUP_SHA256) { throw "$env:INNO_SETUP_INSTALLER has SHA-256 $Hash, not the pinned $env:INNO_SETUP_SHA256" }
+          $Log = Join-Path $env:RUNNER_TEMP 'innosetup-install.log'
+          $Setup = Start-Process -FilePath $Installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/ALLUSERS', "/LOG=`"$Log`"" -Wait -PassThru
+          if ($Setup.ExitCode -ne 0) {
+            Get-Content -LiteralPath $Log -Tail 40 -ErrorAction SilentlyContinue
+            throw "Inno Setup $env:INNO_SETUP_VERSION's installer exited with $($Setup.ExitCode)"
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $AppDir = "..\..\..\build\windows\x64\runner\Release"
+          $Inno = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayVersion -eq $env:INNO_SETUP_VERSION } |
+            Select-Object -First 1
+          if (-not $Inno) { throw "Inno Setup $env:INNO_SETUP_VERSION is not installed" }
+          & (Join-Path $Inno.InstallLocation 'ISCC.exe') /DAppVersion=preview /DAppArch=x64 /DAppDir=$AppDir windows\packaging\exe\setup.iss
+
+      - name: Zip portable build
+        shell: pwsh
+        run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "skystream-windows-x64-preview.zip"
+
+      - name: Upload Windows builds
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: |
+            windows/packaging/exe/Output/*.exe
+            skystream-windows-x64-preview.zip
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [sync, android, windows]
+    if: needs.sync.outputs.build == 'true' && needs.android.result == 'success' && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Rename APK and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find artifacts -type f | sort)
+          printf 'Files to upload:\n%s\n' "${files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No build files to publish."
+            exit 1
+          fi
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Android and Windows builds of feat/self-hosted-profile-sync at ${SHA:0:7}."
+            echo
+            echo "- Android: skystream-android-preview.apk"
+            echo "- Windows installer: SkyStream-Windows-x64-Setup-preview.exe"
+            echo "- Windows portable zip: skystream-windows-x64-preview.zip"
+            echo
+            echo "Built by https://github.com/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}."
+          } > "$notes"
+          gh release delete sync-preview --repo "$GH_REPO" --cleanup-tag --yes || true
+          gh release create sync-preview "${files[@]}" \
+            --repo "$GH_REPO" \
+            --target "$SHA" \
+            --title "SkyStream Preview (Latest)" \
+            --notes-file "$notes" \
+            --prerelease \
+            --latest
+          echo "Release: https://github.com/$GH_REPO/releases/tag/sync-preview"
