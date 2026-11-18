@@ -140,7 +140,7 @@ jobs:
 
       - name: Build release APK
         run: |
-          flutter build apk --release --dart-define-from-file=dart-defines.json
+          flutter build apk --release --build-number=$((2006 + GITHUB_RUN_NUMBER)) --dart-define-from-file=dart-defines.json
           cp build/app/outputs/flutter-apk/app-release.apk skystream-android-preview.apk
 
       - name: Upload APK
